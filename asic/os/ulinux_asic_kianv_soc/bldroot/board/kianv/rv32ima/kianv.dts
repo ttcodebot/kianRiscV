@@ -7,12 +7,12 @@
 	model = "riscv-minimal-nommu,qemu";
 
 	chosen {
-		bootargs = "earlycon=uart8250,mmio,0x10000000,3000000 console=ttyS0 debug";
+		bootargs = "earlycon=uart8250,mmio,0x10000000,115200 console=ttyS0 debug";
 	};
 
 	memory@80000000 {
 		device_type = "memory";
-		reg = <0x00 0x80000000 0x00 0x7ff000>;
+		reg = <0x00 0x80000000 0x00 0xfff000>;
 	};
 
 	cpus {
@@ -87,6 +87,13 @@
 			interrupts-extended = <0x02 0x03 0x02 0x07>;
 			reg = <0x00 0x11000000 0x00 0x10000>;
 			compatible = "sifive,clint0\0riscv,clint0";
+		};
+
+		gpio@10600000 {
+			compatible = "kianv,gpio0";
+			reg = <0x00 0x10600000 0x00 0x0c>;
+			ngpios = <0x08>;
+			status = "okay";
 		};
 	};
 

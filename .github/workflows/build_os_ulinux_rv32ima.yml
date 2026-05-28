@@ -1,4 +1,4 @@
-name: Build OS KianV RV32IMA ASIC Tiny Tapeout uLinux
+name: Build OS KianV RV32IMA gf180mcu uLinux (16 MiB QSPI PSRAM)
 
 on:
   push:

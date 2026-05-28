@@ -8,10 +8,10 @@ DIR := buildroot
 CC = gcc
 CFLAGS = -Wall -g
 
-# Default configurations for the bootloader
-CPU_FREQ ?= 31500000
-SPI_FREQ ?= 10000000
-BAUDRATE ?= 3000000
+# Default configurations for the bootloader (gf180mcu: 16 MHz core, 16 MiB QSPI PSRAM)
+CPU_FREQ ?= 16000000
+SPI_FREQ ?= 8000000
+BAUDRATE ?= 115200
 SOC_HAS_SPI ?= 0
 
 DTS_FILE ?= bldroot/board/kianv/rv32ima/kianv.dts
