@@ -7,7 +7,7 @@
 	model = "riscv-minimal-nommu,qemu";
 
 	chosen {
-		bootargs = "earlycon=uart8250,mmio,0x10000000,115200 console=ttyS0 debug";
+		bootargs = "earlycon=uart8250,mmio,0x10000000,3000000 console=ttyS0 debug";
 	};
 
 	memory@80000000 {
