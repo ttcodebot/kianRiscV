@@ -60,6 +60,9 @@ customize_buildroot: clone-buildroot
 	@cp -av bldroot/configs/kianv_rv32ima_buildroot_defconfig $(DIR)/configs/
 	@cp -av bldroot/package $(DIR)/
 	@rsync -avz --delete bldroot/rootfs-overlay $(DIR)/
+	@if ! grep -q 'kianv-micropython' $(DIR)/package/Config.in; then \
+		sed -i 's|source "package/micropython/Config.in"|source "package/kianv-micropython/Config.in"\n\t&|' $(DIR)/package/Config.in; \
+	fi
 	@make -C $(DIR) kianv_rv32ima_buildroot_defconfig
 	@echo "Applying patch if not already applied..."
 

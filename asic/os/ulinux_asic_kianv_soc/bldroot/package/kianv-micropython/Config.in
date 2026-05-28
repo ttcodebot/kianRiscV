@@ -1,0 +1,10 @@
+config BR2_PACKAGE_KIANV_MICROPYTHON
+	bool "kianv-micropython"
+	help
+	  MicroPython interpreter built for the KianV RV32IMA noMMU SoC
+	  (gf180mcu variant). This is a stripped-down unix-port build with
+	  threads, FFI, SSL, btree and sockets disabled so that it links
+	  statically against uClibc. machine.mem32 is still available for
+	  direct MMIO access to the SoC's GPIO peripheral at 0x10600000.
+
+	  http://micropython.org
