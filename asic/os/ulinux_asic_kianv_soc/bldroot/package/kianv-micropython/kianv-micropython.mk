@@ -13,9 +13,7 @@
 ################################################################################
 
 KIANV_MICROPYTHON_VERSION = 1.19.1
-KIANV_MICROPYTHON_SITE = https://github.com/micropython/micropython/archive/refs/tags
-KIANV_MICROPYTHON_SOURCE = v$(KIANV_MICROPYTHON_VERSION).tar.gz
-KIANV_MICROPYTHON_DL_OPTS = -O kianv-micropython-$(KIANV_MICROPYTHON_VERSION).tar.gz
+KIANV_MICROPYTHON_SITE = $(call github,micropython,micropython,v$(KIANV_MICROPYTHON_VERSION))
 KIANV_MICROPYTHON_LICENSE = MIT, BSD-1-Clause, BSD-3-Clause, Zlib
 KIANV_MICROPYTHON_LICENSE_FILES = LICENSE
 KIANV_MICROPYTHON_DEPENDENCIES = host-pkgconf host-python3
