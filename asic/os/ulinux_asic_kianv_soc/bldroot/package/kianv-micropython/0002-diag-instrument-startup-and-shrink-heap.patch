@@ -1,0 +1,134 @@
+DIAGNOSTIC PATCH (not for production):
+
+The default unix port hangs on real silicon (gf180mcu uLinux SoC, 30 MHz,
+16 MiB QSPI PSRAM, no hardware RNG) even for `micropython -c 'pass'`.
+The same binary runs fine under QEMU virt. To bisect where it hangs we:
+
+1. Instrument main() / main_() with raw `write(2, ...)` markers before
+   and after each major init step (libc entry, stack-limit, malloc,
+   gc_init, mp_init, do_str). The markers go to stderr via the raw
+   write() syscall so they bypass MicroPython's I/O layer entirely --
+   the last marker you see on the serial console identifies the exact
+   step that didn't return.
+
+2. Shrink the default heap from 1 MiB to 128 KiB so a slow / failing
+   malloc on a 16-MiB-total-RAM noMMU/uClibc target is ruled out.
+
+3. Switch `mp_hal_get_random()` to non-blocking flags (GRND_INSECURE
+   then GRND_NONBLOCK) so a never-initialised entropy pool can't be
+   the cause. With CONFIG_HW_RANDOM unset the kernel may never seed,
+   and libc / mp init paths that call getrandom(.., 0) block forever.
+
+When the bisect is done this patch is dropped.
+
+Signed-off-by: kianv POST diag <noreply@anthropic.com>
+
+--- a/ports/unix/main.c
++++ b/ports/unix/main.c
+@@ -30,6 +30,7 @@
+ #include <signal.h>
+ #include <stdint.h>
+ #include <stdio.h>
++#include <unistd.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <errno.h>
+@@ -60,7 +61,11 @@
+ // We need this when configuring the heap size for the MICROPY_GC_SPLIT_HEAP
+ // option, which is currently only enabled for some configs.
+
+-long heap_size = 1024 * 1024 * (sizeof(mp_uint_t) / 4);
++/* DIAG: shrunk from 1 MiB to 128 KiB to rule out heap-alloc issues on
++ * the kianv noMMU/uClibc target (16 MiB total PSRAM). */
++long heap_size = 128 * 1024;
++
++#define DIAG(s) (void)!write(2, "[MP] " s "\n", sizeof("[MP] " s "\n") - 1)
+
+ STATIC void stderr_print_strn(void *env, const char *str, size_t len) {
+     (void)env;
+@@ -439,6 +444,7 @@
+ MP_NOINLINE int main_(int argc, char **argv);
+
+ int main(int argc, char **argv) {
++    DIAG("enter main");
+     #if MICROPY_PY_THREAD
+     mp_thread_init();
+     #endif
+@@ -452,6 +458,7 @@
+ }
+
+ MP_NOINLINE int main_(int argc, char **argv) {
++    DIAG("enter main_");
+     #ifdef SIGPIPE
+     // Do not raise SIGPIPE, instead return EPIPE. Otherwise, e.g. writing
+     // to peer-closed socket will lead to sudden termination of MicroPython
+@@ -473,21 +480,27 @@
+     stack_limit *= 2;
+     #endif
+     mp_stack_set_limit(stack_limit);
++    DIAG("post stack_set_limit");
+
+     pre_process_options(argc, argv);
++    DIAG("post pre_process_options");
+
+     #if MICROPY_ENABLE_GC
++    DIAG("pre malloc heap");
+     char *heap = malloc(heap_size);
++    DIAG("post malloc heap");
+     gc_init(heap, heap + heap_size);
++    DIAG("post gc_init");
+     #endif
+
+     #if MICROPY_ENABLE_PYSTACK
+     static mp_obj_t pystack[1024];
+     mp_pystack_init(pystack, &pystack[MP_ARRAY_SIZE(pystack)]);
++    DIAG("post pystack_init");
+     #endif
+
+     mp_init();
++    DIAG("post mp_init");
+
+     #if MICROPY_EMIT_NATIVE
+     // Set default emitter options
+@@ -592,7 +605,9 @@
+                     // CPython is sloppy about terminating arguments of -c switch
+                     // with a newline, but unlike CPython, we don't accept multiple
+                     // statements on a single line.
++                    DIAG("pre do_str");
+                     ret = do_str(argv[a + 1]);
++                    DIAG("post do_str");
+                     break;
+                 }
+                 #if MICROPY_USE_READLINE
+--- a/ports/unix/unix_mphal.c
++++ b/ports/unix/unix_mphal.c
+@@ -244,9 +244,28 @@
+     #endif
+ }
+
++/* DIAG: never block on entropy. CONFIG_HW_RANDOM is not set in the
++ * kianv kernel, so a freshly booted noMMU userspace can sit in
++ * getrandom(.., 0) forever waiting for the pool to seed. Try
++ * GRND_INSECURE (returns immediately with whatever entropy exists,
++ * Linux 5.6+), fall back to GRND_NONBLOCK, fall back to a fixed seed. */
++#ifndef GRND_NONBLOCK
++#define GRND_NONBLOCK 0x1u
++#endif
++#ifndef GRND_INSECURE
++#define GRND_INSECURE 0x4u
++#endif
++
+ void mp_hal_get_random(size_t n, void *buf) {
+     #ifdef _HAVE_GETRANDOM
+-    RAISE_ERRNO(getrandom(buf, n, 0), errno);
++    int ret = getrandom(buf, n, GRND_INSECURE);
++    if (ret < 0) {
++        ret = getrandom(buf, n, GRND_NONBLOCK);
++    }
++    if (ret < 0) {
++        /* Last-ditch: deterministic non-zero fill so callers don't see all-0. */
++        for (size_t i = 0; i < n; i++) ((unsigned char *)buf)[i] = (unsigned char)(0xa5 ^ i);
++    }
+     #else
+     int fd = open("/dev/urandom", O_RDONLY);
+     RAISE_ERRNO(fd, errno);
