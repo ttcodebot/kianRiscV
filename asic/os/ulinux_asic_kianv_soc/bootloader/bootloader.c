@@ -28,6 +28,10 @@
 #define UART_LSR        0x10000005u
 #define UART_DIV        0x10000010u
 
+#define GPIO_UO_EN      0x10600000u
+#define GPIO_UO_OUT     0x10600004u
+#define GPIO_UI_IN      0x10600008u
+
 #define SYSCON          0x11100000u
 #define SYSCON_HALT     0x5555u
 
@@ -86,14 +90,33 @@ static void uart_drain(void) {
     while ((mmio_r8(UART_LSR) & LSR_TEMT) == 0) { }
 }
 
+/* ---- uo / GPIO routing --------------------------------------------------
+ * The SoC default maps UART TX to uo_out[0]. Setting GPIO_UO_EN bits steals
+ * those pins for GPIO_UO_OUT. We use this to drive a 7-segment spinner
+ * during the bulk sweeps, but only when ui_in[0] is held high -- otherwise
+ * we stay UART-only so the operator can capture clean dots on the console.
+ * Before any final UART message (PASS / FAIL / halt) we always release
+ * uo by clearing GPIO_UO_EN so the bytes are visible. */
+static inline void uo_release(void) {
+    mmio_w32(GPIO_UO_EN, 0u);
+}
+static inline int ui_switch_on(void) {
+    return (int)(mmio_r32(GPIO_UI_IN) & 1u);
+}
+
+/* Outer-ring chase: a, b, c, d, e, f. const -> .rodata, lives in flash. */
+static const uint8_t spinner_glyphs[6] = { 0x01u, 0x02u, 0x04u, 0x08u, 0x10u, 0x20u };
+
 /* ---- Terminal states ---------------------------------------------------- */
 static void halt(void) {
+    uo_release();
     uart_drain();
     mmio_w32(SYSCON, SYSCON_HALT);
     for (;;) { }
 }
 
 static void fail(int test, uint32_t addr, uint32_t exp, uint32_t got) {
+    uo_release();
     uart_puts("\nFAIL test=");
     uart_putc((char)('0' + test));
     uart_puts(" addr=");
@@ -175,7 +198,24 @@ static int probe_psram(void) {
  * .rodata-in-flash and read-only, which is fine.
  */
 
-#define DOT_EVERY(p) do { (p) += 4; if ((p) >= PROGRESS_BYTES) { (p) = 0; uart_putc('.'); } } while (0)
+/* Per-MiB tick: either advance the GPIO spinner (if ui_in[0] is high) or
+ * emit a UART '.', not both. Polled live so the operator can toggle the
+ * switch mid-test and the feedback mode flips at the next tick. */
+static inline void tick_event(uint32_t *spin_idx) {
+    if (ui_switch_on()) {
+        mmio_w32(GPIO_UO_EN, 0xFFu);
+        mmio_w32(GPIO_UO_OUT, (uint32_t)spinner_glyphs[*spin_idx]);
+    } else {
+        uo_release();
+        uart_putc('.');
+    }
+    *spin_idx = (*spin_idx + 1u) % 6u;
+}
+
+#define DOT_EVERY(p, sp) do { \
+        (p) += 4; \
+        if ((p) >= PROGRESS_BYTES) { (p) = 0; tick_event(sp); } \
+    } while (0)
 
 static inline uint32_t xs32(uint32_t x) {
     x ^= x << 13;
@@ -184,7 +224,7 @@ static inline uint32_t xs32(uint32_t x) {
     return x;
 }
 
-static void test_addr_in_data(int idx) {
+static void test_addr_in_data(int idx, uint32_t *spin_idx) {
     volatile uint32_t *p;
     uint32_t a;
     uint32_t progress;
@@ -192,7 +232,7 @@ static void test_addr_in_data(int idx) {
     uart_puts("\n[1/3] address-in-data  write");
     progress = 0;
     p = (volatile uint32_t *)PSRAM_BASE;
-    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) { *p++ = a; DOT_EVERY(progress); }
+    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) { *p++ = a; DOT_EVERY(progress, spin_idx); }
 
     uart_puts(" verify");
     progress = 0;
@@ -200,12 +240,12 @@ static void test_addr_in_data(int idx) {
     for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
         uint32_t v = *p++;
         if (v != a) fail(idx, a, a, v);
-        DOT_EVERY(progress);
+        DOT_EVERY(progress, spin_idx);
     }
     uart_puts(" OK");
 }
 
-static void test_inverse_addr(int idx) {
+static void test_inverse_addr(int idx, uint32_t *spin_idx) {
     volatile uint32_t *p;
     uint32_t a;
     uint32_t progress;
@@ -213,7 +253,7 @@ static void test_inverse_addr(int idx) {
     uart_puts("\n[2/3] inverse-address  write");
     progress = 0;
     p = (volatile uint32_t *)PSRAM_BASE;
-    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) { *p++ = ~a; DOT_EVERY(progress); }
+    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) { *p++ = ~a; DOT_EVERY(progress, spin_idx); }
 
     uart_puts(" verify");
     progress = 0;
@@ -221,12 +261,12 @@ static void test_inverse_addr(int idx) {
     for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
         uint32_t v = *p++;
         if (v != ~a) fail(idx, a, ~a, v);
-        DOT_EVERY(progress);
+        DOT_EVERY(progress, spin_idx);
     }
     uart_puts(" OK");
 }
 
-static void test_lfsr(int idx) {
+static void test_lfsr(int idx, uint32_t *spin_idx) {
     volatile uint32_t *p;
     uint32_t a, s;
     uint32_t progress;
@@ -238,7 +278,7 @@ static void test_lfsr(int idx) {
     for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
         s = xs32(s);
         *p++ = s;
-        DOT_EVERY(progress);
+        DOT_EVERY(progress, spin_idx);
     }
 
     uart_puts(" verify");
@@ -249,7 +289,7 @@ static void test_lfsr(int idx) {
         s = xs32(s);
         uint32_t v = *p++;
         if (v != s) fail(idx, a, s, v);
-        DOT_EVERY(progress);
+        DOT_EVERY(progress, spin_idx);
     }
     uart_puts(" OK");
 }
@@ -269,11 +309,16 @@ int main(void) {
         halt();
     }
 
-    uart_puts("\nprobe phase clean. starting bulk sweeps (one '.' per MiB)\n");
-    test_addr_in_data(1);
-    test_inverse_addr(2);
-    test_lfsr(3);
+    uart_puts("\nprobe phase clean. starting bulk sweeps\n");
+    uart_puts("  ui_in[0]=0 -> UART dots (one per MiB)\n");
+    uart_puts("  ui_in[0]=1 -> 7-seg outer-ring spinner on uo_out (UART silent)\n");
 
+    uint32_t spin_idx = 0;
+    test_addr_in_data(1, &spin_idx);
+    test_inverse_addr(2, &spin_idx);
+    test_lfsr(3, &spin_idx);
+
+    uo_release();
     uart_puts("\n\nPASS - all PSRAM tests succeeded\n");
     halt();
     return 0;
