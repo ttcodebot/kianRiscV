@@ -31,6 +31,32 @@ SECTIONS {
         _etext = .;
     } >FLASH
 
+    /*
+     * No RAM region is defined, so .data and .bss MUST be empty. Capture
+     * any stragglers here and fail the link if a future change introduces
+     * one -- writes to .bss-in-flash silently no-op or hang the bus at
+     * runtime, which is exactly the kind of bug we don't want to debug
+     * twice.
+     */
+    .data (NOLOAD) : {
+        *(.data)
+        *(.data*)
+        *(.sdata)
+        *(.sdata*)
+    } >FLASH
+    ASSERT(SIZEOF(.data) == 0,
+        "ERROR: POST bootloader has no RAM region; .data must be empty (use stack locals)")
+
+    .bss (NOLOAD) : {
+        *(.bss)
+        *(.bss*)
+        *(.sbss)
+        *(.sbss*)
+        *(COMMON)
+    } >FLASH
+    ASSERT(SIZEOF(.bss) == 0,
+        "ERROR: POST bootloader has no RAM region; .bss must be empty (use stack locals)")
+
     /DISCARD/ : {
         *(.eh_frame)
         *(.eh_frame_hdr)

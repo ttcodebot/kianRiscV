@@ -1,30 +1,27 @@
 /*
- * POST (Power-On Self-Test) bootloader for the KianV gf180mcu uLinux SoC.
- *
- * UART-only variant: progress, results, and failure detail all go to UART
- * @ 115200 8N1. The 7-segment display / GPIO_UO_EN peripheral is left
- * untouched so the SoC's default uo_out mapping (UART TX on uo_out[0])
- * stays live for the whole run.
+ * POST bootloader for the KianV gf180mcu uLinux SoC. UART-only @ 115200 8N1.
  *
  * Sequence:
- *   1. Init UART divider (CPU_FREQ / BAUDRATE), print banner + test region.
- *   2. For each PSRAM test:
- *        write-sweep over [0x80000000, 0x80FFF000) with a per-MiB dot,
- *        then a verify-sweep with the same dot cadence,
- *        print "OK" or "FAIL test=N addr=0x.. exp=0x.. got=0x.." + halt.
- *   3. After all three tests pass: print "PASS" and halt via syscon
- *      (write 0x5555 to 0x11100000).
+ *   1. UART init, banner.
+ *   2. Probe phase: write+read 2 patterns at 8 sparse PSRAM addresses,
+ *      with uart_drain() bracketing every store/load. The LAST line you
+ *      see is exactly the operation that hung, so the address (and
+ *      whether the write or the read stalled) is pinpointable on a
+ *      hung bus.
+ *   3. If all probes pass, run three full-coverage sweeps over
+ *      [0x80000000, 0x80FFF000) with one '.' per MiB of traffic:
+ *        [1/3] address-in-data    w = a
+ *        [2/3] inverse-address    w = ~a
+ *        [3/3] xorshift32 LFSR    deterministic PRNG
+ *   4. PASS  -> "PASS" + syscon halt.
+ *      FAIL  -> "FAIL test=N addr=0x.. exp=0x.. got=0x.." + syscon halt.
  *
- * Tests:
- *   1) address-in-data    w = a
- *   2) inverse-address    w = ~a
- *   3) xorshift32 LFSR    deterministic PRNG, write-pass / re-seed / verify
- *
- * The test region stops 4 KiB below the top of PSRAM so the CPU stack
- * (sp = 0x81000000, growing down) never collides with the test sweep.
+ * The 7-segment / GPIO peripheral is left untouched so the SoC's default
+ * uo_out mapping (UART TX on uo_out[0]) stays live throughout.
  */
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* ---- MMIO addresses ----------------------------------------------------- */
 #define UART_DATA       0x10000000u
@@ -45,13 +42,11 @@
 #define BAUDRATE        115200u
 #endif
 
-/* One dot of UART progress per MiB of memory traffic. 16 dots per sweep,
- * 32 per test, 96 total for the whole POST. */
-#define PROGRESS_BYTES  (1u << 20)
+#define PROGRESS_BYTES  (1u << 20)    /* one '.' per MiB                    */
 
-/* LSR bits (8250-compatible) */
-#define LSR_THRE        0x20u   /* THR empty - ok to write next byte    */
-#define LSR_TEMT        0x40u   /* TX shift register empty - safe halt  */
+/* LSR bits (8250-compatible). */
+#define LSR_THRE        0x20u   /* THR empty - ok to write next byte        */
+#define LSR_TEMT        0x40u   /* TX shift register empty - safe to halt   */
 
 /* ---- Tiny helpers ------------------------------------------------------- */
 static inline void mmio_w32(uint32_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
@@ -84,7 +79,9 @@ static void uart_putx32(uint32_t v) {
     for (i = 28; i >= 0; i -= 4) uart_putc(hex[(v >> i) & 0xfu]);
 }
 
-/* Wait for the shift register to flush before stopping the clock. */
+/* Block until the shift register is fully empty, so the last visible byte
+ * really did make it out before whatever follows (a HALT, or a PSRAM
+ * access that may hang the bus). */
 static void uart_drain(void) {
     while ((mmio_r8(UART_LSR) & LSR_TEMT) == 0) { }
 }
@@ -109,22 +106,76 @@ static void fail(int test, uint32_t addr, uint32_t exp, uint32_t got) {
     halt();
 }
 
-/* ---- Progress dot ------------------------------------------------------- */
-static uint32_t g_progress;
+/* ---- Probe phase -------------------------------------------------------- */
+/*
+ * Spot-check a handful of addresses spread across the PSRAM window. Every
+ * MMIO access is bracketed by uart_drain() so that, if the bus hangs, the
+ * very last line printed identifies the offending step exactly:
+ *
+ *   "0x80000000 wr 0xdeadbeef ..."   --> hang was on the WRITE
+ *   "0x80000000 wr 0xdeadbeef rd"    --> hang was on the READ
+ *   "0x80000000 wr 0xdeadbeef rd 0xdeadbeef OK"   --> step survived
+ */
+static int probe_addr(uint32_t addr) {
+    static const uint32_t patterns[2] = { 0xDEADBEEFu, 0x12345678u };
+    int ok = 1;
+    for (int i = 0; i < 2; i++) {
+        uint32_t pat = patterns[i];
+        uart_puts("  ");
+        uart_putx32(addr);
+        uart_puts(" wr ");
+        uart_putx32(pat);
+        uart_drain();
 
-static inline void tick(uint32_t bytes) {
-    g_progress += bytes;
-    if (g_progress >= PROGRESS_BYTES) {
-        g_progress -= PROGRESS_BYTES;
-        uart_putc('.');
+        mmio_w32(addr, pat);
+        uart_puts(" rd");
+        uart_drain();
+
+        uint32_t v = mmio_r32(addr);
+        uart_putc(' ');
+        uart_putx32(v);
+        if (v == pat) {
+            uart_puts(" OK\n");
+        } else {
+            uart_puts(" MISMATCH\n");
+            ok = 0;
+        }
     }
+    return ok;
 }
 
-static inline void progress_reset(void) {
-    g_progress = 0;
+static int probe_psram(void) {
+    /* Sparse fan-out across the 16 MiB window. The top-most probe sits
+     * one page below the stack guard so it never collides with sp. */
+    static const uint32_t addrs[] = {
+        0x80000000u,
+        0x80000004u,    /* second word at base catches address-line[0..1] */
+        0x80010000u,    /* 64 KiB in                                       */
+        0x80100000u,    /* 1 MiB                                           */
+        0x80400000u,    /* 4 MiB                                           */
+        0x80800000u,    /* 8 MiB (likely bank boundary on 2x8 MiB layouts) */
+        0x80C00000u,    /* 12 MiB                                          */
+        0x80FFE000u,    /* near top, well below stack                      */
+    };
+    uart_puts("\n--- probe phase (write+read 2 patterns at 8 addresses) ---\n");
+    int all_ok = 1;
+    for (size_t i = 0; i < sizeof(addrs)/sizeof(addrs[0]); i++) {
+        if (!probe_addr(addrs[i])) all_ok = 0;
+    }
+    return all_ok;
 }
 
-/* ---- Memory tests ------------------------------------------------------- */
+/* ---- Bulk memory tests -------------------------------------------------- *
+ * NOTE on globals: the linker script (kianv.ld) only defines a FLASH MEMORY
+ * region; there is no RAM section and crt0 does not zero .bss. Any
+ * non-const static here would land in flash (or worse), and writes to it
+ * would silently no-op or hang the bus. So all per-test state lives on
+ * the stack (top-of-PSRAM, known good because the banner prints).
+ * The const tables in probe_psram() / uart_putx32() / patterns[] are
+ * .rodata-in-flash and read-only, which is fine.
+ */
+
+#define DOT_EVERY(p) do { (p) += 4; if ((p) >= PROGRESS_BYTES) { (p) = 0; uart_putc('.'); } } while (0)
 
 static inline uint32_t xs32(uint32_t x) {
     x ^= x << 13;
@@ -136,19 +187,20 @@ static inline uint32_t xs32(uint32_t x) {
 static void test_addr_in_data(int idx) {
     volatile uint32_t *p;
     uint32_t a;
+    uint32_t progress;
 
     uart_puts("\n[1/3] address-in-data  write");
-    progress_reset();
+    progress = 0;
     p = (volatile uint32_t *)PSRAM_BASE;
-    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) { *p++ = a; tick(4); }
+    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) { *p++ = a; DOT_EVERY(progress); }
 
     uart_puts(" verify");
-    progress_reset();
+    progress = 0;
     p = (volatile uint32_t *)PSRAM_BASE;
     for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
         uint32_t v = *p++;
         if (v != a) fail(idx, a, a, v);
-        tick(4);
+        DOT_EVERY(progress);
     }
     uart_puts(" OK");
 }
@@ -156,19 +208,20 @@ static void test_addr_in_data(int idx) {
 static void test_inverse_addr(int idx) {
     volatile uint32_t *p;
     uint32_t a;
+    uint32_t progress;
 
     uart_puts("\n[2/3] inverse-address  write");
-    progress_reset();
+    progress = 0;
     p = (volatile uint32_t *)PSRAM_BASE;
-    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) { *p++ = ~a; tick(4); }
+    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) { *p++ = ~a; DOT_EVERY(progress); }
 
     uart_puts(" verify");
-    progress_reset();
+    progress = 0;
     p = (volatile uint32_t *)PSRAM_BASE;
     for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
         uint32_t v = *p++;
         if (v != ~a) fail(idx, a, ~a, v);
-        tick(4);
+        DOT_EVERY(progress);
     }
     uart_puts(" OK");
 }
@@ -176,26 +229,27 @@ static void test_inverse_addr(int idx) {
 static void test_lfsr(int idx) {
     volatile uint32_t *p;
     uint32_t a, s;
+    uint32_t progress;
 
     uart_puts("\n[3/3] xorshift32 LFSR  write");
-    progress_reset();
+    progress = 0;
     s = 0xCAFEBABEu;
     p = (volatile uint32_t *)PSRAM_BASE;
     for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
         s = xs32(s);
         *p++ = s;
-        tick(4);
+        DOT_EVERY(progress);
     }
 
     uart_puts(" verify");
-    progress_reset();
+    progress = 0;
     s = 0xCAFEBABEu;
     p = (volatile uint32_t *)PSRAM_BASE;
     for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
         s = xs32(s);
         uint32_t v = *p++;
         if (v != s) fail(idx, a, s, v);
-        tick(4);
+        DOT_EVERY(progress);
     }
     uart_puts(" OK");
 }
@@ -209,8 +263,13 @@ int main(void) {
     uart_puts(" .. ");
     uart_putx32(PSRAM_TEST_END);
     uart_puts(" (16 MiB - 4 KiB top reserved for stack)\n");
-    uart_puts("  one '.' per MiB of memory traffic\n");
 
+    if (!probe_psram()) {
+        uart_puts("\nprobe phase reported MISMATCH(es) - skipping bulk sweep\n");
+        halt();
+    }
+
+    uart_puts("\nprobe phase clean. starting bulk sweeps (one '.' per MiB)\n");
     test_addr_in_data(1);
     test_inverse_addr(2);
     test_lfsr(3);
