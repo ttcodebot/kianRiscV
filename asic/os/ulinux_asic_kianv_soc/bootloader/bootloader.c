@@ -1,26 +1,27 @@
 /*
  * POST (Power-On Self-Test) bootloader for the KianV gf180mcu uLinux SoC.
  *
- * Replaces the kernel-loading bootloader on this branch. It does:
- *   1. Init UART (115200 @ 30 MHz) and print a one-line banner.
- *   2. Switch uo_out[7:0] to GPIO mode so the 7-segment display is driven
- *      directly by GPIO_UO_OUT. (This kills UART TX visibility - that is
- *      intentional and documented in the spec.)
- *   3. Run three memory tests on QSPI PSRAM:
- *        1) address-in-data    (write w=a, read back)
- *        2) inverse-address    (write w=~a, read back)
- *        3) xorshift32 LFSR    (write seq, re-seed, verify)
- *      Test region is [0x80000000, 0x80FFF000) -- the top 4 KiB hosts
- *      the CPU stack and is _not_ tested.
- *   4. During each test, advance an outer-ring chase spinner across the
- *      7-segment display every 32 KiB of work.
- *   5. On PASS  -> display 'P' (0x73) and halt via syscon (write 0x5555).
- *   6. On FAIL  -> briefly show failing test index (1/2/3) for ~1 s, then
- *                  blink 'F' / 'F.' at ~2 Hz forever.
+ * UART-only variant: progress, results, and failure detail all go to UART
+ * @ 115200 8N1. The 7-segment display / GPIO_UO_EN peripheral is left
+ * untouched so the SoC's default uo_out mapping (UART TX on uo_out[0])
+ * stays live for the whole run.
  *
- * 7-seg encoding (uo_out[7:0]: bit0=A .. bit6=G, bit7=DP, common cathode):
- *     '0' .. '9', 'P'=0x73, 'F'=0x71, blank=0x00
- *     spinner step k -> 1 << k for k in 0..5  (a,b,c,d,e,f outer chase)
+ * Sequence:
+ *   1. Init UART divider (CPU_FREQ / BAUDRATE), print banner + test region.
+ *   2. For each PSRAM test:
+ *        write-sweep over [0x80000000, 0x80FFF000) with a per-MiB dot,
+ *        then a verify-sweep with the same dot cadence,
+ *        print "OK" or "FAIL test=N addr=0x.. exp=0x.. got=0x.." + halt.
+ *   3. After all three tests pass: print "PASS" and halt via syscon
+ *      (write 0x5555 to 0x11100000).
+ *
+ * Tests:
+ *   1) address-in-data    w = a
+ *   2) inverse-address    w = ~a
+ *   3) xorshift32 LFSR    deterministic PRNG, write-pass / re-seed / verify
+ *
+ * The test region stops 4 KiB below the top of PSRAM so the CPU stack
+ * (sp = 0x81000000, growing down) never collides with the test sweep.
  */
 
 #include <stdint.h>
@@ -30,12 +31,8 @@
 #define UART_LSR        0x10000005u
 #define UART_DIV        0x10000010u
 
-#define GPIO_UO_EN      0x10600000u
-#define GPIO_UO_OUT     0x10600004u
-
 #define SYSCON          0x11100000u
 #define SYSCON_HALT     0x5555u
-#define SYSCON_RESET    0x7777u
 
 #define PSRAM_BASE      0x80000000u
 #define PSRAM_TEST_END  0x80FFF000u   /* top 4 KiB reserved for stack */
@@ -48,22 +45,19 @@
 #define BAUDRATE        115200u
 #endif
 
-/* Spinner step every N test bytes (32 KiB ~ ~8 ms of QSPI traffic). */
-#define SPIN_BYTES      (32u * 1024u)
+/* One dot of UART progress per MiB of memory traffic. 16 dots per sweep,
+ * 32 per test, 96 total for the whole POST. */
+#define PROGRESS_BYTES  (1u << 20)
+
+/* LSR bits (8250-compatible) */
+#define LSR_THRE        0x20u   /* THR empty - ok to write next byte    */
+#define LSR_TEMT        0x40u   /* TX shift register empty - safe halt  */
 
 /* ---- Tiny helpers ------------------------------------------------------- */
-static inline void mmio_w32(uint32_t addr, uint32_t v) {
-    *(volatile uint32_t *)addr = v;
-}
-static inline uint32_t mmio_r32(uint32_t addr) {
-    return *(volatile uint32_t *)addr;
-}
-static inline void mmio_w8(uint32_t addr, uint8_t v) {
-    *(volatile uint8_t *)addr = v;
-}
-static inline uint8_t mmio_r8(uint32_t addr) {
-    return *(volatile uint8_t *)addr;
-}
+static inline void mmio_w32(uint32_t a, uint32_t v) { *(volatile uint32_t *)a = v; }
+static inline uint32_t mmio_r32(uint32_t a)         { return *(volatile uint32_t *)a; }
+static inline void mmio_w8 (uint32_t a, uint8_t v)  { *(volatile uint8_t  *)a = v; }
+static inline uint8_t  mmio_r8 (uint32_t a)         { return *(volatile uint8_t  *)a; }
 
 /* ---- UART --------------------------------------------------------------- */
 static void uart_init(void) {
@@ -72,8 +66,7 @@ static void uart_init(void) {
 }
 
 static void uart_putc(char c) {
-    /* Wait for THR empty (LSR bit 5). */
-    while ((mmio_r8(UART_LSR) & 0x20u) == 0) { }
+    while ((mmio_r8(UART_LSR) & LSR_THRE) == 0) { }
     mmio_w8(UART_DATA, (uint8_t)c);
 }
 
@@ -84,96 +77,55 @@ static void uart_puts(const char *s) {
     }
 }
 
-/* ---- 7-segment display -------------------------------------------------- */
-#define SEG_BLANK   0x00u
-#define SEG_P       0x73u   /* a+b+e+f+g */
-#define SEG_F       0x71u   /* a+e+f+g   */
-#define SEG_DP      0x80u
-#define SEG_1       0x06u
-#define SEG_2       0x5Bu
-#define SEG_3       0x4Fu
-#define SEG_8       0x7Fu
-
-static const uint8_t spinner_steps[6] = {
-    0x01u, /* a */
-    0x02u, /* b */
-    0x04u, /* c */
-    0x08u, /* d */
-    0x10u, /* e */
-    0x20u, /* f */
-};
-
-static void seg_write(uint8_t glyph) {
-    mmio_w32(GPIO_UO_OUT, (uint32_t)glyph);
+static void uart_putx32(uint32_t v) {
+    static const char hex[] = "0123456789abcdef";
+    int i;
+    uart_puts("0x");
+    for (i = 28; i >= 0; i -= 4) uart_putc(hex[(v >> i) & 0xfu]);
 }
 
-static void seg_enable(void) {
-    /* Drive all 8 uo bits from GPIO_UO_OUT. */
-    mmio_w32(GPIO_UO_EN, 0xFFu);
+/* Wait for the shift register to flush before stopping the clock. */
+static void uart_drain(void) {
+    while ((mmio_r8(UART_LSR) & LSR_TEMT) == 0) { }
 }
 
-/* ---- Crude delay loop (no hw timer). At 30 MHz this loop body is ~3
- * cycles, so 30000000/3 = 10M iters/sec. ~1 s = 10_000_000 iters. */
-static void delay_loops(uint32_t loops) {
-    volatile uint32_t i;
-    for (i = 0; i < loops; i++) { }
+/* ---- Terminal states ---------------------------------------------------- */
+static void halt(void) {
+    uart_drain();
+    mmio_w32(SYSCON, SYSCON_HALT);
+    for (;;) { }
 }
-#define DELAY_MS(ms) delay_loops(10000u * (ms))
+
+static void fail(int test, uint32_t addr, uint32_t exp, uint32_t got) {
+    uart_puts("\nFAIL test=");
+    uart_putc((char)('0' + test));
+    uart_puts(" addr=");
+    uart_putx32(addr);
+    uart_puts(" exp=");
+    uart_putx32(exp);
+    uart_puts(" got=");
+    uart_putx32(got);
+    uart_puts("\n");
+    halt();
+}
+
+/* ---- Progress dot ------------------------------------------------------- */
+static uint32_t g_progress;
+
+static inline void tick(uint32_t bytes) {
+    g_progress += bytes;
+    if (g_progress >= PROGRESS_BYTES) {
+        g_progress -= PROGRESS_BYTES;
+        uart_putc('.');
+    }
+}
+
+static inline void progress_reset(void) {
+    g_progress = 0;
+}
 
 /* ---- Memory tests ------------------------------------------------------- */
-/* All tests sweep words in [PSRAM_BASE, PSRAM_TEST_END) and advance the
- * spinner every SPIN_BYTES of work. Return 0 on pass, addr+1 on fail
- * (0 reserved for "no error"). The caller only cares about pass/fail. */
 
-static uint32_t g_spin_idx;
-static uint32_t g_spin_acc;     /* bytes accumulated toward next step    */
-
-static inline void spin_tick(uint32_t bytes) {
-    g_spin_acc += bytes;
-    if (g_spin_acc >= SPIN_BYTES) {
-        g_spin_acc = 0;
-        g_spin_idx = (g_spin_idx + 1u) % 6u;
-        seg_write(spinner_steps[g_spin_idx]);
-    }
-}
-
-static int test_addr_in_data(void) {
-    volatile uint32_t *p;
-    uint32_t a;
-
-    p = (volatile uint32_t *)PSRAM_BASE;
-    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
-        *p++ = a;
-        spin_tick(4);
-    }
-    p = (volatile uint32_t *)PSRAM_BASE;
-    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
-        uint32_t v = *p++;
-        if (v != a) return 1;
-        spin_tick(4);
-    }
-    return 0;
-}
-
-static int test_inverse_addr(void) {
-    volatile uint32_t *p;
-    uint32_t a;
-
-    p = (volatile uint32_t *)PSRAM_BASE;
-    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
-        *p++ = ~a;
-        spin_tick(4);
-    }
-    p = (volatile uint32_t *)PSRAM_BASE;
-    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
-        uint32_t v = *p++;
-        if (v != ~a) return 1;
-        spin_tick(4);
-    }
-    return 0;
-}
-
-/* xorshift32 - reproducible PRNG sequence. */
 static inline uint32_t xs32(uint32_t x) {
     x ^= x << 13;
     x ^= x >> 17;
@@ -181,79 +133,89 @@ static inline uint32_t xs32(uint32_t x) {
     return x;
 }
 
-static int test_lfsr(void) {
+static void test_addr_in_data(int idx) {
+    volatile uint32_t *p;
+    uint32_t a;
+
+    uart_puts("\n[1/3] address-in-data  write");
+    progress_reset();
+    p = (volatile uint32_t *)PSRAM_BASE;
+    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) { *p++ = a; tick(4); }
+
+    uart_puts(" verify");
+    progress_reset();
+    p = (volatile uint32_t *)PSRAM_BASE;
+    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
+        uint32_t v = *p++;
+        if (v != a) fail(idx, a, a, v);
+        tick(4);
+    }
+    uart_puts(" OK");
+}
+
+static void test_inverse_addr(int idx) {
+    volatile uint32_t *p;
+    uint32_t a;
+
+    uart_puts("\n[2/3] inverse-address  write");
+    progress_reset();
+    p = (volatile uint32_t *)PSRAM_BASE;
+    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) { *p++ = ~a; tick(4); }
+
+    uart_puts(" verify");
+    progress_reset();
+    p = (volatile uint32_t *)PSRAM_BASE;
+    for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
+        uint32_t v = *p++;
+        if (v != ~a) fail(idx, a, ~a, v);
+        tick(4);
+    }
+    uart_puts(" OK");
+}
+
+static void test_lfsr(int idx) {
     volatile uint32_t *p;
     uint32_t a, s;
 
+    uart_puts("\n[3/3] xorshift32 LFSR  write");
+    progress_reset();
     s = 0xCAFEBABEu;
     p = (volatile uint32_t *)PSRAM_BASE;
     for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
         s = xs32(s);
         *p++ = s;
-        spin_tick(4);
+        tick(4);
     }
+
+    uart_puts(" verify");
+    progress_reset();
     s = 0xCAFEBABEu;
     p = (volatile uint32_t *)PSRAM_BASE;
     for (a = PSRAM_BASE; a < PSRAM_TEST_END; a += 4) {
         s = xs32(s);
         uint32_t v = *p++;
-        if (v != s) return 1;
-        spin_tick(4);
+        if (v != s) fail(idx, a, s, v);
+        tick(4);
     }
-    return 0;
-}
-
-/* ---- Terminal states ---------------------------------------------------- */
-static void halt_cpu(void) {
-    /* syscon halt -- this stops the CPU clock so the 7-seg latches. */
-    mmio_w32(SYSCON, SYSCON_HALT);
-    for (;;) { }
-}
-
-static void show_pass_and_halt(void) {
-    seg_write(SEG_P);
-    /* Give the display a short settle window before halting (so a logic
-     * analyser snapshot just before halt sees 'P' on the bus). */
-    DELAY_MS(100);
-    halt_cpu();
-}
-
-static void show_fail_forever(int test_idx) {
-    /* Optional digit hint: flash failing test index for ~1 s. */
-    uint8_t hint = SEG_BLANK;
-    if (test_idx == 1) hint = SEG_1;
-    else if (test_idx == 2) hint = SEG_2;
-    else if (test_idx == 3) hint = SEG_3;
-    seg_write(hint);
-    DELAY_MS(1000);
-
-    for (;;) {
-        seg_write(SEG_F);
-        DELAY_MS(250);
-        seg_write(SEG_F | SEG_DP);
-        DELAY_MS(250);
-    }
+    uart_puts(" OK");
 }
 
 /* ---- Entry point -------------------------------------------------------- */
 int main(void) {
     uart_init();
-    uart_puts("\nKianV gf180mcu POST: 16 MiB QSPI PSRAM memtest\n");
+    uart_puts("\nKianV gf180mcu POST: 16 MiB QSPI PSRAM memtest (UART-only)\n");
+    uart_puts("  region = ");
+    uart_putx32(PSRAM_BASE);
+    uart_puts(" .. ");
+    uart_putx32(PSRAM_TEST_END);
+    uart_puts(" (16 MiB - 4 KiB top reserved for stack)\n");
+    uart_puts("  one '.' per MiB of memory traffic\n");
 
-    /* Hand uo_out to GPIO so the 7-segment is driven. UART TX share is
-     * lost from here on - the 7-seg is the result indicator. */
-    seg_enable();
-    seg_write(SEG_8);      /* show '8' as power-on lamp test */
-    DELAY_MS(150);
-    seg_write(SEG_BLANK);
+    test_addr_in_data(1);
+    test_inverse_addr(2);
+    test_lfsr(3);
 
-    g_spin_idx = 0;
-    g_spin_acc = 0;
-
-    if (test_addr_in_data() != 0) show_fail_forever(1);
-    if (test_inverse_addr() != 0) show_fail_forever(2);
-    if (test_lfsr()         != 0) show_fail_forever(3);
-
-    show_pass_and_halt();
+    uart_puts("\n\nPASS - all PSRAM tests succeeded\n");
+    halt();
     return 0;
 }
