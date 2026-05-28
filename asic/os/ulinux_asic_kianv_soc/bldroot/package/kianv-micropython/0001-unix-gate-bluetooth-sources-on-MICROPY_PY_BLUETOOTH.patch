@@ -1,0 +1,55 @@
+From: Kian Linux build <buildroot@kianriscv.local>
+Date: Thu, 28 May 2026 00:00:00 +0000
+Subject: [PATCH] ports/unix: gate Bluetooth source files on MICROPY_PY_BLUETOOTH
+
+The unix port's Makefile unconditionally lists the BTstack / NimBLE
+glue source files (mpbthciport.c, mpbtstackport_*.c, mpnimbleport.c)
+in SRC_C, which makes them visible to the QSTR preprocess pass even
+when MICROPY_PY_BLUETOOTH=0. On a no-pthread / no-libusb cross
+target (here: riscv32 uClibc no-MMU FLAT) the preprocessor then
+fails on missing <pthread.h> / <libusb-1.0/libusb.h> includes:
+
+    mpbtstackport_h4.c:27: fatal error: pthread.h: No such file
+    mpbtstackport_usb.c:27: fatal error: pthread.h: No such file
+
+Wrap the five BT-glue source files in an
+ifeq ($(MICROPY_PY_BLUETOOTH),1) block so they are only added to the
+build when Bluetooth is actually enabled. This matches how every
+other optional module (FFI, JNI, termios, socket, ...) is handled
+just above in the same Makefile.
+
+Upstream MicroPython has reorganized the unix Makefile substantially
+since 1.19.1; this patch is a minimal back-port of the same gating
+idea for 1.19.1 so we can build with MICROPY_PY_BLUETOOTH=0.
+
+Signed-off-by: Kian Linux build <buildroot@kianriscv.local>
+---
+ ports/unix/Makefile | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/ports/unix/Makefile b/ports/unix/Makefile
+--- a/ports/unix/Makefile
++++ b/ports/unix/Makefile
+@@ -229,13 +229,17 @@ SRC_C += \
+ 	moduselect.c \
+ 	alloc.c \
+ 	fatfs_port.c \
++	$(SRC_MOD) \
++	$(wildcard $(VARIANT_DIR)/*.c)
++
++ifeq ($(MICROPY_PY_BLUETOOTH),1)
++SRC_C += \
+ 	mpbthciport.c \
+ 	mpbtstackport_common.c \
+ 	mpbtstackport_h4.c \
+ 	mpbtstackport_usb.c \
+-	mpnimbleport.c \
+-	$(SRC_MOD) \
+-	$(wildcard $(VARIANT_DIR)/*.c)
++	mpnimbleport.c
++endif
+
+ SHARED_SRC_C += $(addprefix shared/,\
+ 	runtime/gchelper_generic.c \
+--
+2.40.0
