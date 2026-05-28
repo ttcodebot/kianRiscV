@@ -18,6 +18,22 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential device-tree-compiler cpio rsync file wget unzip bc
 
+      # Cache the heavy parts of a Buildroot run so subsequent CI builds
+      # skip the toolchain rebuild (~15 min) and only redo the kernel +
+      # rootfs (~5 min). Key bound to anything that influences the build
+      # tree: pinned Buildroot SHA, defconfig, board/, package/, overlay,
+      # bootloader sources, and the top-level Makefile.
+      - name: Cache Buildroot dl + output
+        id: br-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            asic/os/ulinux_asic_kianv_soc/buildroot/dl
+            asic/os/ulinux_asic_kianv_soc/buildroot/output
+          key: br-ulinux-${{ runner.os }}-${{ hashFiles('asic/os/ulinux_asic_kianv_soc/Makefile', 'asic/os/ulinux_asic_kianv_soc/bldroot/configs/kianv_rv32ima_buildroot_defconfig', 'asic/os/ulinux_asic_kianv_soc/bldroot/board/**', 'asic/os/ulinux_asic_kianv_soc/bldroot/package/**', 'asic/os/ulinux_asic_kianv_soc/bldroot/rootfs-overlay/**', 'asic/os/ulinux_asic_kianv_soc/bootloader/**', 'asic/os/ulinux_asic_kianv_soc/hello_7seg/**') }}
+          restore-keys: |
+            br-ulinux-${{ runner.os }}-
+
       - name: Build OS
         working-directory: asic/os/ulinux_asic_kianv_soc
         run: make all bootloader

@@ -3,6 +3,10 @@
 SHELL := /bin/bash
 REPO_URL := https://github.com/cnlohr/buildroot.git
 BRANCH := master
+# Pinned cnlohr/buildroot master HEAD as of 2026-05-28. Pinning lets CI
+# cache buildroot/output/ deterministically — change this SHA only with
+# intent and bust the workflow cache key accordingly.
+BUILDROOT_SHA := 851edd247f5e2e8e10f943c52218bc54c657688f
 DIR := buildroot
 
 CC = gcc
@@ -65,13 +69,17 @@ customize_buildroot: clone-buildroot
 
 clone-buildroot:
 	@if [ ! -d "$(DIR)" ]; then \
-	    echo "Cloning Buildroot into $(DIR)..."; \
-	    git clone -b $(BRANCH) $(REPO_URL) $(DIR) --depth=1 && \
+	    echo "Cloning Buildroot into $(DIR) and pinning to $(BUILDROOT_SHA)..."; \
+	    git clone $(REPO_URL) $(DIR) && \
 	    pushd $(DIR) && \
+	    git checkout $(BUILDROOT_SHA) && \
 	    popd; \
 	else \
-	    echo "Already cloned Buildroot into $(DIR)..."; \
+	    echo "Already cloned Buildroot into $(DIR), ensuring pin $(BUILDROOT_SHA)..."; \
 	    pushd $(DIR) && \
+	    if [ "$$(git rev-parse HEAD)" != "$(BUILDROOT_SHA)" ]; then \
+	        git fetch origin && git checkout $(BUILDROOT_SHA); \
+	    fi && \
 	    popd; \
 	fi
 
