@@ -11,7 +11,7 @@ CFLAGS = -Wall -g
 # Default configurations for the bootloader (gf180mcu: 30 MHz core, 16 MiB QSPI PSRAM)
 CPU_FREQ ?= 30000000
 SPI_FREQ ?= 10000000
-BAUDRATE ?= 3000000
+BAUDRATE ?= 115200
 SOC_HAS_SPI ?= 0
 
 DTS_FILE ?= bldroot/board/kianv/rv32ima/kianv.dts

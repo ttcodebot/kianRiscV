@@ -8,7 +8,7 @@ TOOLCHAIN_PREFIX ?= $(TOOLCHAIN_PATH)/riscv32-buildroot-linux-uclibc
 
 CPU_FREQ ?= 30000000
 SPI_FREQ ?= 10000000
-BAUDRATE ?= 3000000
+BAUDRATE ?= 115200
 IMAGE_SIZE ?= $(shell wc -c < ../Image)
 SOC_HAS_SPI ?= 0
 
