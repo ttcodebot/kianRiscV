@@ -63,7 +63,7 @@ define KIANV_MICROPYTHON_BUILD_CMDS
 endef
 
 define KIANV_MICROPYTHON_INSTALL_TARGET_CMDS
-	$(INSTALL) -D -m 0755 $(@D)/ports/unix/build-standard/micropython \
+	$(INSTALL) -D -m 0755 $(@D)/ports/unix/micropython \
 		$(TARGET_DIR)/usr/bin/micropython
 	$(INSTALL) -d -m 0755 $(TARGET_DIR)/usr/lib/micropython
 	$(INSTALL) -D -m 0644 package/kianv-micropython/kianv_gpio.py \
