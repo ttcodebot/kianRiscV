@@ -1,52 +1,62 @@
-# SPDX-FileCopyrightText: © 2023 Uri Shaked   <uri@wokwi.com>
-#                           2023/2024 Hirosh Dabui <hirosh@dabui.de>
 # SPDX-License-Identifier: MIT
+#
+# POST bootloader for KianV gf180mcu uLinux SoC.
+# Pure freestanding RV32IMA. No libc, no libgcc, no startfiles.
 
-TOOLCHAIN_PATH ?= ../buildroot/output/host/bin
+# Default to the Ubuntu 24.04 bare-metal multilib toolchain
+# (apt package: gcc-riscv64-unknown-elf).
+TOOLCHAIN_PREFIX ?= riscv64-unknown-elf
 
-TOOLCHAIN_PREFIX ?= $(TOOLCHAIN_PATH)/riscv32-buildroot-linux-uclibc
+CC      := $(TOOLCHAIN_PREFIX)-gcc
+OBJCOPY := $(TOOLCHAIN_PREFIX)-objcopy
+OBJDUMP := $(TOOLCHAIN_PREFIX)-objdump
+SIZE    := $(TOOLCHAIN_PREFIX)-size
 
 CPU_FREQ ?= 30000000
-SPI_FREQ ?= 10000000
 BAUDRATE ?= 115200
-IMAGE_SIZE ?= $(shell wc -c < ../Image)
-SOC_HAS_SPI ?= 0
 
-LDS_FILE ?= kianv.ld
-START_FILE = crt0.S
-INCLUDE_DIR = .
-FILE = bootloader.c
-OPT_LEVEL ?= -Os
-FILEwoSUFFIX = $(basename $(FILE))
-RVCPPFLAGS = -fno-exceptions -fno-enforce-eh-specs
-RVLDFLAGS = -Wl,-melf32lriscv -Wl,-belf32-littleriscv -Wl,--no-relax
-RVCFLAGS = -fno-pic -march=rv32ima -mabi=ilp32 -fno-stack-protector -w -Wl,--no-relax -ffreestanding -Wl,--strip-debug,-Map=bootloader.map
-RVCFLAGS += -nostartfiles -DCPU_FREQ=$(CPU_FREQ) -DSPI_FREQ=$(SPI_FREQ) -DBAUDRATE=$(BAUDRATE)
-RVCFLAGS += -DIMAGE_SIZE=$(IMAGE_SIZE) -DSOC_HAS_SPI=$(SOC_HAS_SPI) -Wl,--no-warn-rwx-segments
+LDS_FILE := kianv.ld
 
-all: bootloader.bin
-	@echo "Image size is $(IMAGE_SIZE) bytes"
+CFLAGS := -march=rv32ima -mabi=ilp32 \
+          -Os -ffreestanding -fno-pic -fno-stack-protector \
+          -fno-builtin -fno-common \
+          -ffunction-sections -fdata-sections \
+          -Wall -Wextra \
+          -DCPU_FREQ=$(CPU_FREQ) -DBAUDRATE=$(BAUDRATE)
 
-crt0.o: $(START_FILE)
-	$(TOOLCHAIN_PREFIX)-as $(START_FILE) -o crt0.o
+ASFLAGS := -march=rv32ima -mabi=ilp32
 
-$(FILEwoSUFFIX).s: $(FILE)
-	$(TOOLCHAIN_PREFIX)-gcc -S -fverbose-asm $(OPT_LEVEL) $(RVCFLAGS) -I$(INCLUDE_DIR) $< $(START_FILE) -c
+LDFLAGS := -nostdlib -nostartfiles -static \
+           -Wl,--no-relax \
+           -Wl,--gc-sections \
+           -Wl,-melf32lriscv \
+           -Wl,-Map=bootloader.map \
+           -T$(LDS_FILE)
 
-$(FILEwoSUFFIX).lst: $(FILEwoSUFFIX).s
-	$(TOOLCHAIN_PREFIX)-as -alhnd $< > $@
+OBJS := crt0.o bootloader.o
 
-$(FILEwoSUFFIX).o: $(FILE)
-	$(TOOLCHAIN_PREFIX)-gcc $(OPT_LEVEL) $(RVCFLAGS) -I$(INCLUDE_DIR) $< $(START_FILE) -c
+all: bootloader.bin bootloader.elf
+	@echo "--- size ---"
+	@$(SIZE) bootloader.elf
+	@echo "--- bin ---"
+	@ls -l bootloader.bin
 
-bootloader.elf: crt0.o $(FILEwoSUFFIX).o
-	$(TOOLCHAIN_PREFIX)-gcc $(OPT_LEVEL) $(RVCFLAGS) $(RVLDFLAGS) -T$(LDS_FILE) -o $@ crt0.o $(FILEwoSUFFIX).o -lc -lm -lgcc
+crt0.o: crt0.S
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+bootloader.o: bootloader.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+bootloader.elf: $(OBJS) $(LDS_FILE)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJS)
 
 bootloader.bin: bootloader.elf
-	$(TOOLCHAIN_PREFIX)-objcopy -O binary $< $@
+	$(OBJCOPY) -O binary $< $@
+
+dump: bootloader.elf
+	$(OBJDUMP) -d $< | less
 
 clean:
-	rm -f *.o *.elf *.bin *.s *.map
+	rm -f *.o *.elf *.bin *.map *.s *.lst
 
-.PHONY: all clean help
-
+.PHONY: all clean dump

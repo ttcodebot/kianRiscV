@@ -1,73 +1,45 @@
-/* Linker script for programs stored in SPI flash
- * Inspired from picorv32/picosoc/sections.lds
+/*
+ * Linker script for the POST bootloader.
  *
- * Sections:
- * - text and rodata are sent to FLASH.
- * - bss and data sections are sent to PSRAM.
- * - Data sections have initialization data in flash.
- * - AT keyword specifies LMA (Load Memory Address).
- *
- * Usage:
- * - If you got a lot of code that does not fit in RAM,
- *   you may keep text sections in flash using spiflash_icebreaker_run_from_flash.ld.
+ * The bootloader runs out of XIP SPI flash at 0x20100000. It is fully
+ * self-contained (no .data init, no .bss): the C code only touches
+ * constants (in flash) and stack-allocated locals. The stack lives in
+ * the top 4 KiB of PSRAM (0x80FFF000..0x80FFFFFF) which is _excluded_
+ * from the memory test region (test range is [0x80000000, 0x80FFF000)).
  */
 
 MEMORY {
-  FLASH (rx)  : ORIGIN = 0x020100000, LENGTH = 0x10000000
-  PSRAM  (rwx) : ORIGIN = 0x080000000 + (8*1024*1024 - (32*1024)), LENGTH = 0x00002000
+    FLASH (rx) : ORIGIN = 0x20100000, LENGTH = 16M - 1M
 }
 
-__stacktop = ORIGIN(PSRAM) + LENGTH(PSRAM);
+/* Top of PSRAM (16 MiB at 0x80000000). Stack grows down from here. */
+__stacktop      = 0x81000000;
+
+/* Test region: [POST_MEM_START, POST_MEM_END). Last 4 KiB reserved for
+ * the stack and is _not_ touched by the test. */
+__post_mem_start = 0x80000000;
+__post_mem_end   = 0x80FFF000;
 
 SECTIONS {
-    /* C runtime initialization code and readonly data goes to FLASH */
-    .text : {
+    .text 0x20100000 : {
         . = ALIGN(4);
-        crt0.o(.text)        /* c runtime initialization (code) */
-        *(.text)             /* .text sections (code) */
-        *(.text*)            /* .text* sections (code) */
-        *(.rodata)           /* .rodata sections (constants, strings, etc.) */
-        *(.rodata*)          /* .rodata* sections (constants, strings, etc.) */
-        _etext = .;          /* define a global symbol at end of code */
-        _sidata = _etext;    /* This is used by the startup to initialize the .data section */
+        KEEP(*(.text.boot))
+        *(.text)
+        *(.text*)
+        *(.rodata)
+        *(.rodata*)
+        _etext = .;
     } >FLASH
 
-    /* Initialized data section (data in RAM but initial values in FLASH) */
-    .data : AT( _sidata ) {
-        . = ALIGN(4);
-        _sdata = .;          /* create a global symbol at data start */
-        _ram_start = .;      /* global symbol at RAM start (e.g., for GC) */
-
-        *(.data)
-        *(.data*)
-        . = ALIGN(4);
-        _edata = .;          /* define a global symbol at data end */
-    } > FLASH
-
-    /* Uninitialized data section */
-    .bss : {
-        . = ALIGN(4);
-        _sbss = .;           /* define a global symbol at bss start */
-        *(.bss)
-        *(.bss*)
-        . = ALIGN(4);
-        _ebss = .;           /* define a global symbol at bss end */
-    } >PSRAM
-
-    /* Stack and heap definitions */
-    .heap : {
-        . = ALIGN(4);
-        _heap_start = .;     /* define a global symbol at heap start */
-        _end = .;            /* define end of heap as expected by syscalls.c */
-    } >PSRAM
-
-    /* Miscellaneous sections that need to be included */
-    .misc : {
-        . = ALIGN(4);
+    /DISCARD/ : {
         *(.eh_frame)
         *(.eh_frame_hdr)
-        *(.init_array)
+        *(.comment)
+        *(.note*)
         *(.gcc_except_table*)
-    } >FLASH
+        *(.init_array)
+        *(.fini_array)
+        *(.ctors)
+        *(.dtors)
+    }
 }
-

@@ -1,0 +1,41 @@
+name: Build POST bootloader (KianV gf180mcu uLinux SoC)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install RISC-V bare-metal toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-riscv64-unknown-elf
+
+      - name: Build POST bootloader
+        working-directory: asic/os/ulinux_asic_kianv_soc/bootloader
+        run: make
+
+      - name: Inspect ELF (reset vector + size + symbols)
+        working-directory: asic/os/ulinux_asic_kianv_soc/bootloader
+        run: |
+          riscv64-unknown-elf-size bootloader.elf
+          echo "--- first 40 instructions ---"
+          riscv64-unknown-elf-objdump -d bootloader.elf | head -60
+          echo "--- undefined symbols (should be empty) ---"
+          riscv64-unknown-elf-nm -u bootloader.elf || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: post_bootloader
+          path: |
+            asic/os/ulinux_asic_kianv_soc/bootloader/bootloader.bin
+            asic/os/ulinux_asic_kianv_soc/bootloader/bootloader.elf
+            asic/os/ulinux_asic_kianv_soc/bootloader/bootloader.map

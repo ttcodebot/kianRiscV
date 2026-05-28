@@ -1,17 +1,29 @@
-.text
-.global _start
-.type _start, @function
+/*
+ * POST bootloader crt0 for KianV gf180mcu uLinux SoC.
+ *
+ * Runs out of XIP SPI flash (entry point at 0x20100000).
+ * Stack lives in PSRAM at the very top (last 4 KiB, 0x80FFF000..0x80FFFFFF).
+ * The memtest skips that top 4 KiB so it doesn't trample its own stack.
+ *
+ * No .data init / no .bss zeroing -- the POST bootloader does not rely
+ * on either: all C locals live on the stack and all globals are const.
+ */
+
+    .section .text.boot, "ax"
+    .global _start
+    .type _start, @function
 
 _start:
-    addi x1, zero, 0
-    addi x2, zero, 0
-    addi x3, zero, 0
-    addi x4, zero, 0
-    addi x5, zero, 0
-    addi x6, zero, 0
-    addi x7, zero, 0
-    addi x8, zero, 0
-    addi x9, zero, 0
+    /* Zero all GPRs (deterministic startup). */
+    addi x1,  zero, 0
+    addi x2,  zero, 0
+    addi x3,  zero, 0
+    addi x4,  zero, 0
+    addi x5,  zero, 0
+    addi x6,  zero, 0
+    addi x7,  zero, 0
+    addi x8,  zero, 0
+    addi x9,  zero, 0
     addi x10, zero, 0
     addi x11, zero, 0
     addi x12, zero, 0
@@ -35,27 +47,14 @@ _start:
     addi x30, zero, 0
     addi x31, zero, 0
 
-    lui sp, %hi(__stacktop)
+    /* sp = __stacktop (top of PSRAM, 16-byte aligned). */
+    lui  sp, %hi(__stacktop)
     addi sp, sp, %lo(__stacktop)
 
-    la a0, _sbss
-    la a1, _ebss
-    bge a0, a1, 1f
-0:
-    addi a0, a0, 4
-    sw zero, -4(a0)
-    blt a0, a1, 0b
-1:
-    la a0, _sidata
-    la a1, _sdata
-    la a2, _edata
-    bge a1, a2, 3f
-2:
-    lw a3, 0(a0)
-    addi a0, a0, 4
-    addi a1, a1, 4
-    sw a3, -4(a1)
-    blt a1, a2, 2b
-3:
     call main
 
+    /* If main ever returns, halt via syscon (write 0x5555 to 0x11100000). */
+1:  lui  t0, 0x11100
+    li   t1, 0x5555
+    sw   t1, 0(t0)
+    j    1b
