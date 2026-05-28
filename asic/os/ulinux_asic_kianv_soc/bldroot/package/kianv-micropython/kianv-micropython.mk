@@ -19,11 +19,13 @@ KIANV_MICROPYTHON_LICENSE_FILES = LICENSE
 KIANV_MICROPYTHON_DEPENDENCIES = host-pkgconf host-python3
 
 # Some architectures (incl. riscv32) need the setjmp-based register dump for GC.
-# GCC 14 (Ubuntu 24.04) trips -Wdangling-pointer= on py/stackctrl.c (a
-# documented false-positive; the captured stack_dummy frame lives for the
-# lifetime of the interpreter). Newer MicroPython silences this upstream;
-# 1.19.1 does not, so we disable -Werror for that warning here.
-KIANV_MICROPYTHON_CFLAGS = -DMICROPY_GCREGS_SETJMP=1 -Wno-error=dangling-pointer
+# MicroPython 1.19.1 predates GCC 14 by ~2 years and trips several of its new
+# strict warnings (-Wdangling-pointer in py/stackctrl.c, -Wenum-int-mismatch in
+# mpy-cross/main.c, etc). All of these are upstream-fixed in newer MicroPython
+# releases but a 1.19.1 bump is too invasive here, so we keep the warnings
+# (informative) but make them non-fatal by appending -Wno-error after the
+# port's CWARN=-Werror.
+KIANV_MICROPYTHON_CFLAGS = -DMICROPY_GCREGS_SETJMP=1 -Wno-error
 
 # Variant 'standard' keeps the machine module (machine.mem32 etc) which is
 # the whole point of this build. We disable every feature that needs
